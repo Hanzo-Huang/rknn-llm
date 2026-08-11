@@ -76,8 +76,11 @@ compatibility with the former shell entry point. With `-p ALL`, `-o` is used
 as a base path and outputs are placed below per-platform subdirectories.
 
 Without `--dataset`, the default is
-`output/<model>/<model>_data_quant.json`. For a quantized LLM this file is
-generated automatically with the repository's calibration helper.
+`output/<model>/<model>_data_quant.json`. For local models below the
+repository's `models/` directory, nested directories are preserved; for
+example, `models/Qwen3/Qwen3-4B` writes under `output/Qwen3/Qwen3-4B/`.
+For a quantized LLM the calibration file is generated automatically with the
+repository's calibration helper.
 
 With `--platform ALL` and no explicit `--dtype`, the wrapper builds exactly
 three artifacts: `w4a16_g128` and `w8a8` for RK3576, plus `w8a8` for RK3588.
@@ -100,8 +103,9 @@ Useful overrides include `--device`, `--load-dtype`, `--optimization-level`,
 VLM conversion runs the existing vision exporter and RKNN exporter, then uses
 the same wrapper for the language RKLLM component. It writes artifacts below
 `output/<model>/<platform>/` and the calibration file below `output/<model>/`
-by default. VLM vision export uses `cuda` by default; use `--vision-device cpu`
-only when GPU export is unavailable.
+by default. `--output-dir` overrides this common output root for calibration,
+vision, and language artifacts. VLM vision export uses `cuda` by default; use
+`--vision-device cpu` only when GPU export is unavailable.
 
 ```bash
 python tools/custom_export.py --kind vlm \

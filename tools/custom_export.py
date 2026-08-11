@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--dtype", choices=DTYPES, default=None, help="quantization type (default: w4a16 for RK3576, w8a8 for RK3588; with --platform ALL, omitted uses the supported platform matrix; fp disables quantization)")
     parser.add_argument("--dataset", default=None, help="RKLLM calibration dataset; generated when omitted for quantized conversion")
     parser.add_argument("-o", "--output", default=None, help="output .rkllm path; with ALL, used as the fan-out base path")
-    parser.add_argument("--output-dir", default=None, help="directory for platform-specific VLM artifacts (default: output/<model>/<platform>)")
+    parser.add_argument("--output-dir", default=None, help="common output directory for calibration and model artifacts (default: output/<model>)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda", help="device used while loading the language model")
     parser.add_argument("--load-dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--model-lora", default=None, help="optional LoRA model path")
@@ -245,17 +245,35 @@ def validate_calibration_dataset(dataset: Path) -> None:
         raise SystemExit(f"Calibration dataset must be a JSON list: {dataset}")
 
 
-def default_output(model: Path, dtype: str, platform: str) -> Path:
+def default_output(model: Path, dtype: str, platform: str,
+                   output_dir: Path | None = None) -> Path:
     suffix = ".rkllm"
-    directory = ROOT / "output" / model.name / platform
+    directory = (output_dir or model_output_dir(model)) / platform
     return directory / f"{model.name}_{platform}_{dtype}{suffix}"
 
 
+def model_output_dir(model: Path) -> Path:
+    """Return the default output directory for a local model.
+
+    Preserve nested directories below the repository's ``models`` directory
+    so, for example, ``models/Qwen3/Qwen3-4B`` maps to
+    ``output/Qwen3/Qwen3-4B``. Model IDs and local models outside this
+    repository continue to use a directory named after the model itself.
+    """
+    models_root = ROOT / "models"
+    try:
+        relative_model = model.relative_to(models_root)
+    except ValueError:
+        relative_model = Path(model.name)
+    return ROOT / "output" / relative_model
+
+
 def requested_output(model: Path, dtype: str, platform: str,
-                     requested: str | None, multiple: bool) -> Path:
+                     requested: str | None, multiple: bool,
+                     output_dir: Path | None = None) -> Path:
     """Resolve one output, including the legacy fan-out behavior for ALL."""
     if not requested:
-        return default_output(model, dtype, platform)
+        return default_output(model, dtype, platform, output_dir)
     output = Path(requested).expanduser().resolve()
     if not multiple:
         return output
@@ -407,26 +425,29 @@ def main() -> int:
     model = Path(args.model).expanduser().resolve() if Path(args.model).exists() else Path(args.model)
     platform = platform_name(args.platform)
     matrix = conversion_matrix(platform, args.dtype)
+    output_root = (Path(args.output_dir).expanduser().resolve()
+                   if args.output_dir else model_output_dir(model))
     language_outputs = [
-        requested_output(model, dtype, target_platform, args.output, len(matrix) > 1)
+        requested_output(model, dtype, target_platform, args.output, len(matrix) > 1,
+                         output_root)
         for target_platform, dtype in matrix
     ]
     language_pending = not args.vision_only and (
         args.force or any(not output.exists() for output in language_outputs)
     )
     dataset = Path(args.dataset).expanduser().resolve() if args.dataset else None
-    model_output_dir = ROOT / "output" / model.name
+    model_output = output_root
     if args.kind == "llm" and language_pending and dataset is None:
-        dataset = model_output_dir / f"{model.name}_data_quant.json"
+        dataset = model_output / f"{model.name}_data_quant.json"
         if args.dtype != "fp" and not dataset.exists():
             dataset.parent.mkdir(parents=True, exist_ok=True)
             run([sys.executable, str(LLM_EXPORT / "generate_data_quant.py"), "-m", str(model), "-o", str(dataset)], LLM_EXPORT)
         elif args.dtype != "fp" and dataset.exists():
             print(f"Skipping existing calibration dataset: {dataset}")
     if args.kind == "vlm" and language_pending and dataset is None:
-        dataset = model_output_dir / f"{model.name}_data_quant.json"
+        dataset = model_output / f"{model.name}_data_quant.json"
     if args.kind == "vlm" and args.prepare_dataset and dataset is None:
-        dataset = model_output_dir / f"{model.name}_data_quant.json"
+        dataset = model_output / f"{model.name}_data_quant.json"
     if args.kind == "vlm" and (args.prepare_dataset or (language_pending and args.dtype != "fp")) and dataset is not None and dataset.exists() and not args.force:
         print(f"Skipping existing calibration dataset: {dataset}")
     elif args.kind == "vlm" and (args.prepare_dataset or (language_pending and args.dtype != "fp")) and dataset is not None:
@@ -435,7 +456,7 @@ def main() -> int:
         generated = VLM_DATA / "llm_inputs.json"
         dataset.parent.mkdir(parents=True, exist_ok=True)
         make_vlm_dataset_paths_absolute(generated, dataset, VLM_DATA)
-    elif args.kind == "vlm" and dataset is not None and dataset.parent == model_output_dir:
+    elif args.kind == "vlm" and dataset is not None and dataset.parent == model_output:
         # Repair manifests created by an earlier wrapper version. Keep the
         # sample files in the example data directory, outside the output tree.
         make_vlm_dataset_paths_absolute(dataset, dataset, VLM_DATA)
@@ -444,17 +465,18 @@ def main() -> int:
             raise SystemExit("A calibration dataset is required for quantized conversion; pass --dataset.")
         validate_calibration_dataset(dataset)
     if args.kind == "vlm" and not args.skip_vision:
-        custom_vision_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
+        custom_vision_dir = output_root if args.output_dir else None
         vision_platforms = list(dict.fromkeys(target for target, _ in matrix))
         for index, vision_platform in enumerate(vision_platforms):
             vision_dir = (custom_vision_dir / vision_platform if custom_vision_dir and platform == "ALL"
-                          else custom_vision_dir if custom_vision_dir else model_output_dir / vision_platform)
+                          else custom_vision_dir if custom_vision_dir else model_output / vision_platform)
             export_vlm_vision(args, model, vision_dir, vision_platform,
                               export_onnx=(index == 0 if platform == "ALL" else None))
     if args.kind == "vlm" and args.vision_only:
         return 0
     for target_platform, dtype in matrix:
-        output = requested_output(model, dtype, target_platform, args.output, len(matrix) > 1)
+        output = requested_output(model, dtype, target_platform, args.output, len(matrix) > 1,
+                                  output_root)
         if output.exists() and not args.force:
             print(f"Skipping existing: {output}")
             continue
