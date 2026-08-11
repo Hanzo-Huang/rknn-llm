@@ -248,7 +248,7 @@ def validate_calibration_dataset(dataset: Path) -> None:
 def default_output(model: Path, dtype: str, platform: str) -> Path:
     suffix = ".rkllm"
     directory = ROOT / "output" / model.name / platform
-    return directory / f"{model.name}_{dtype}_{platform}{suffix}"
+    return directory / f"{model.name}_{platform}_{dtype}{suffix}"
 
 
 def requested_output(model: Path, dtype: str, platform: str,
@@ -260,7 +260,7 @@ def requested_output(model: Path, dtype: str, platform: str,
     if not multiple:
         return output
     stem = output.name[:-len(".rkllm")] if output.name.endswith(".rkllm") else output.name
-    return output.parent / platform / f"{stem}_{dtype}_{platform}.rkllm"
+    return output.parent / platform / f"{stem}_{platform}_{dtype}.rkllm"
 
 
 def run(command: list[str], cwd: Path) -> None:
@@ -358,8 +358,8 @@ def export_vlm_vision(args: argparse.Namespace, model: Path, output_dir: Path,
     output_dir.mkdir(parents=True, exist_ok=True)
     onnx_dir = output_dir.parent
     onnx_dir.mkdir(parents=True, exist_ok=True)
-    copied_onnx = onnx_dir / onnx.name
-    copied_rknn = output_dir / rknn.name
+    copied_onnx = onnx_dir / f"{model.name}_vision.onnx"
+    copied_rknn = output_dir / f"{model.name}_vision_{platform}.rknn"
 
     run_onnx = args.vision_stage in ("all", "onnx") and (args.force or not copied_onnx.exists())
     if export_onnx is not None:

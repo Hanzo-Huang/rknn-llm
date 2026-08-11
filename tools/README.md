@@ -68,6 +68,9 @@ python tools/custom_export.py \
 This generates one calibration dataset, then builds `w4a16_g128` and `w8a8`
 for RK3576 and `w8a8` for RK3588.
 
+Artifacts use the model directory name consistently: `<model>_vision.onnx`,
+`<model>_vision_<platform>.rknn`, and `<model>_<platform>_<dtype>.rkllm`.
+
 The short options `-m`, `-p`, `-q`, `-O`, `-o`, and `-c` are provided for
 compatibility with the former shell entry point. With `-p ALL`, `-o` is used
 as a base path and outputs are placed below per-platform subdirectories.
