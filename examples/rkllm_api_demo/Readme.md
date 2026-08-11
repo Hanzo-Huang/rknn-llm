@@ -5,9 +5,9 @@
 ## 1. Requirements
 
 ```
-rkllm-toolkit==1.2.x
-rkllm-runtime==1.2.x
-python >=3.8
+rkllm-toolkit>=1.3.0
+rkllm-runtime>=1.3.0
+python>=3.9
 ```
 
 ## 2. Model Conversion
