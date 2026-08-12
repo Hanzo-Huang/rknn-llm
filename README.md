@@ -1,5 +1,11 @@
 # Description
 
+> **Repository difference:** This checkout is based on the original
+> [airockchip/rknn-llm](https://github.com/airockchip/rknn-llm) repository and
+> adds a custom RKLLM v1.3.0 conversion wrapper for LLM and VLM models. The
+> wrapper is available at [tools/custom_export.py](tools/custom_export.py); see
+> the [conversion guide](tools/README.md) for setup and usage.
+
   RKLLM software stack can help users to quickly deploy AI models to Rockchip chips. The overall framework is as follows:
     <center class="half">
         <div style="background-color:#ffffff;">

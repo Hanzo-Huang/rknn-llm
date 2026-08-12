@@ -1,8 +1,13 @@
-# Convenient model conversion
+# Custom conversion code (RKLLM v1.3.0)
 
-`custom_export.py` is a repository-owned compatibility wrapper around the
-Rockchip-generated conversion examples. It does not modify those examples, so
-updating the SDK remains a reviewable operation.
+This repository is a small customization layer for the Rockchip RKLLM v1.3.0
+conversion examples. `custom_export.py` is a repository-owned compatibility
+wrapper around the Rockchip-generated conversion examples. It does not modify
+those examples, so updating the SDK remains a reviewable operation.
+
+The wrapper converts LLM and VLM models to RKLLM/RKNN artifacts. This is
+conversion code only; the RKLLM toolkit/runtime and RKNN toolkit are still
+required separately.
 
 The wrapper uses `run_vision.py` for both VLM vision stages. Use
 `--vision-stage onnx` to generate only ONNX, `--vision-stage rknn` to convert
