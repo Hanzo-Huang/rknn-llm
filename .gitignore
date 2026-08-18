@@ -1,4 +1,5 @@
-/models/
+/models/*
+!/models/README.md
 /output/
 
 # Python caches and local environments
