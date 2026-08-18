@@ -137,12 +137,18 @@ python tools/custom_export.py --kind vlm --model /models/Qwen2.5-VL-3B-Instruct 
   --vision-stage rknn --vision-only
 ```
 
-For supported Qwen VLMs, calibration data is generated automatically when it
-does not exist. It can also be generated explicitly:
+For supported Qwen VLMs and DeepSeek-OCR, calibration data is generated
+automatically when it does not exist. DeepSeek-OCR calibration follows the
+upstream model implementation and requires CUDA. It can also be generated
+explicitly:
 
 ```bash
 python tools/custom_export.py --kind vlm --model /models/Qwen3-VL \
   --prepare-dataset \
+  --platform RK3588 --dtype w8a8
+
+python tools/custom_export.py --kind vlm --model /models/DeepSeek-OCR \
+  --prepare-dataset --skip-vision \
   --platform RK3588 --dtype w8a8
 ```
 

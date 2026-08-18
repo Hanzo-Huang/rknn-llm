@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LLM_EXPORT = ROOT / "examples" / "rkllm_api_demo" / "export"
 VLM_EXPORT = ROOT / "examples" / "multimodal_model_demo" / "export"
 VLM_DATA = ROOT / "examples" / "multimodal_model_demo" / "data"
+TOOLS = ROOT / "tools"
 PLATFORMS = ("RK3576", "RK3588")
 DTYPES = (
     "fp",
@@ -37,7 +38,7 @@ DTYPES = (
     "w8a8_g512",
 )
 DEFAULT_DTYPES = {"RK3576": "w4a16", "RK3588": "w8a8"}
-VLM_MODELS = ("minicpm-v-2_6", "qwen2_5-vl-3b", "qwen3-vl", "qwen3.5", "smolvlm", "internvl3-1b", "deepseekocr")
+VLM_MODELS = ("minicpm-v-2_6", "qwen2-vl", "qwen2_5-vl-3b", "qwen3-vl", "qwen3.5", "smolvlm", "internvl3-1b", "deepseekocr")
 
 
 def positive_int(value: str) -> int:
@@ -215,6 +216,156 @@ def rkllm_model_view(model: Path):
         yield staged
 
 
+@contextmanager
+def deepseekocr_model_view(model: Path):
+    """Temporarily apply Rockchip's DeepSeek-OCR export requirements."""
+    if not model.is_dir() or not (model / "modeling_deepseekocr.py").is_file():
+        yield model
+        return
+
+    deepencoder_path = model / "deepencoder.py"
+    configuration_path = model / "configuration_deepseek_v2.py"
+    ocr_modeling_path = model / "modeling_deepseekocr.py"
+    rockchip_modeling = VLM_EXPORT / "modeling_deepseekv2.py"
+    required = (
+        deepencoder_path,
+        configuration_path,
+        ocr_modeling_path,
+        rockchip_modeling,
+    )
+    if any(not path.is_file() for path in required):
+        raise SystemExit("DeepSeek-OCR compatibility sources are incomplete")
+
+    deepencoder = deepencoder_path.read_text(encoding="utf-8")
+    if "antialias=True" not in deepencoder and "antialias=False" not in deepencoder:
+        raise SystemExit("DeepSeek-OCR deepencoder.py has an unexpected layout")
+    deepencoder = deepencoder.replace("antialias=True", "antialias=False")
+    position_ids_buffer = '''        self.register_buffer(
+            "position_ids", torch.arange(self.num_positions).expand((1, -1))
+        )'''
+    if position_ids_buffer not in deepencoder:
+        raise SystemExit("DeepSeek-OCR position_ids buffer has an unexpected layout")
+    deepencoder = deepencoder.replace(
+        position_ids_buffer,
+        '''        self.register_buffer(
+            "position_ids",
+            torch.arange(self.num_positions).expand((1, -1)),
+            persistent=False,
+        )''',
+        1,
+    )
+
+    # DeepSeek-OCR targets Transformers 4.46, while current RKLLM environments
+    # use Transformers 5. Stage compatibility edits without changing the model.
+    configuration = configuration_path.read_text(encoding="utf-8")
+    super_block = """        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )"""
+    config_anchor = "        self.vocab_size = vocab_size"
+    if (
+        super_block in configuration
+        and configuration.index(super_block) > configuration.index(config_anchor)
+    ):
+        configuration = configuration.replace(super_block, "", 1)
+        configuration = configuration.replace(
+            config_anchor, super_block + "\n\n" + config_anchor, 1
+        )
+
+    modeling = rockchip_modeling.read_text(encoding="utf-8")
+    legacy_fx_import = "from transformers.utils.import_utils import is_torch_fx_available"
+    if legacy_fx_import in modeling:
+        modeling = modeling.replace(
+            legacy_fx_import,
+            "try:\n"
+            "    from transformers.utils.import_utils import is_torch_fx_available\n"
+            "except ImportError:\n"
+            "    def is_torch_fx_available():\n"
+            "        return hasattr(torch, 'fx')",
+            1,
+        )
+
+    config_path = model / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.setdefault("pad_token_id", 2)
+    ocr_modeling = ocr_modeling_path.read_text(encoding="utf-8")
+    ocr_config_marker = (
+        "class DeepseekOCRConfig(DeepseekV2Config):\n"
+        "    model_type = \"DeepseekOCR\""
+    )
+    ocr_config_replacement = ocr_config_marker + """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        defaults = {
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "aux_loss_alpha": 0.001,
+            "ep_size": 1,
+            "hidden_act": "silu",
+            "initializer_range": 0.02,
+            "moe_layer_freq": 1,
+            "norm_topk_prob": False,
+            "rms_norm_eps": 1e-6,
+            "rope_scaling": None,
+            "rope_theta": 10000.0,
+            "rope_parameters": {
+                "rope_type": "default", "rope_theta": 10000.0
+            },
+            "routed_scaling_factor": 1.0,
+            "scoring_func": "softmax",
+            "seq_aux": True,
+            "use_cache": True,
+        }
+        for name, value in defaults.items():
+            if not hasattr(self, name) or (
+                name == "rope_parameters" and getattr(self, name) is None
+            ):
+                setattr(self, name, value)
+        if not hasattr(self, "use_return_dict"):
+            self.use_return_dict = getattr(self, "return_dict", True)"""
+    if ocr_config_marker not in ocr_modeling:
+        raise SystemExit("DeepSeek-OCR configuration wrapper has an unexpected layout")
+    ocr_modeling = ocr_modeling.replace(
+        ocr_config_marker, ocr_config_replacement, 1
+    )
+
+    with tempfile.TemporaryDirectory(prefix="rkllm-deepseekocr-") as temp:
+        staged = Path(temp) / model.name
+        staged.mkdir()
+        replaced = {
+            "config.json",
+            "configuration_deepseek_v2.py",
+            "deepencoder.py",
+            "modeling_deepseekocr.py",
+            "modeling_deepseekv2.py",
+        }
+        for source in model.iterdir():
+            if source.name not in replaced:
+                (staged / source.name).symlink_to(
+                    source, target_is_directory=source.is_dir()
+                )
+        (staged / "deepencoder.py").write_text(deepencoder, encoding="utf-8")
+        (staged / "configuration_deepseek_v2.py").write_text(
+            configuration, encoding="utf-8"
+        )
+        (staged / "modeling_deepseekv2.py").write_text(
+            modeling, encoding="utf-8"
+        )
+        (staged / "modeling_deepseekocr.py").write_text(
+            ocr_modeling, encoding="utf-8"
+        )
+        (staged / "config.json").write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print("Using temporary DeepSeek-OCR compatibility view")
+        yield staged
+
+
 def make_vlm_dataset_paths_absolute(source: Path, destination: Path,
                                     sample_root: Path | None = None) -> None:
     """Copy a VLM calibration manifest without copying its sample directory."""
@@ -309,7 +460,8 @@ def export_rkllm(args: argparse.Namespace, model: Path, dataset: Path | None,
     algorithm = args.quantized_algorithm or ("grq" if dtype.startswith("w4") else "normal")
     llm = RKLLM()
     with ExitStack() as stack:
-        load_model = stack.enter_context(rkllm_model_view(model))
+        load_model = stack.enter_context(deepseekocr_model_view(model))
+        load_model = stack.enter_context(rkllm_model_view(load_model))
         print(f"Loading model: {model}")
         ret = llm.load_huggingface(
             model=str(load_model), model_lora=args.model_lora, device=args.device,
@@ -345,8 +497,9 @@ def infer_vlm_model_name(model: Path, explicit: str | None) -> str:
         ("qwen3.5", "qwen3.5"), ("qwen3_5", "qwen3.5"),
         ("qwen3_vl", "qwen3-vl"), ("qwen2.5_vl", "qwen2_5-vl-3b"),
         ("qwen2_5_vl", "qwen2_5-vl-3b"), ("minicpm_v_2_6", "minicpm-v-2_6"),
+        ("qwen2_vl", "qwen2-vl"),
         ("smolvlm", "smolvlm"), ("internvl3", "internvl3-1b"),
-        ("deepseekocr", "deepseekocr"),
+        ("deepseek_ocr", "deepseekocr"), ("deepseekocr", "deepseekocr"),
     )
     for marker, model_name in aliases:
         if marker in name:
@@ -362,9 +515,63 @@ def infer_dataset_model_type(model: Path, explicit: str | None) -> str:
         return "qwen3.5"
     if "qwen3_vl" in name:
         return "qwen3vl"
+    if "qwen2_vl" in name:
+        return "qwen2vl"
     if "qwen2.5_vl" in name or "qwen2_5_vl" in name:
         return "qwen2.5vl"
     raise SystemExit("Could not detect VLM calibration model type; pass --model-type explicitly.")
+
+
+def export_qwen2_vl_rknn(onnx: Path, output: Path, args: argparse.Namespace,
+                         platform: str) -> None:
+    """Convert Qwen2-VL's single-input ONNX without changing the SDK script."""
+    from rknn.api import RKNN
+
+    rknn = RKNN(verbose=False)
+    rknn.config(
+        target_platform=platform.lower(),
+        mean_values=[[0.48145466 * 255, 0.4578275 * 255, 0.40821073 * 255]],
+        std_values=[[0.26862954 * 255, 0.26130258 * 255, 0.27577711 * 255]],
+    )
+    rknn.load_onnx(
+        str(onnx),
+        inputs=["pixel"],
+        input_size_list=[[args.batch_size, 3, args.height, args.width]],
+    )
+    rknn.build(do_quantization=False, dataset=None)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rknn.export_rknn(str(output))
+    if hasattr(rknn, "release"):
+        rknn.release()
+
+
+def smolvlm_export_script() -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    """Return a temporary SmolVLM exporter compatible with newer Transformers.
+
+    Recent Transformers versions build the vision attention mask through
+    ``create_bidirectional_mask``. During tracing, that path can receive a
+    scalar ``q_length`` and fail before ONNX export. The exporter only needs
+    the vision encoder output, so bypass that mask construction and run the
+    encoder with an explicit ``None`` mask in a temporary copy.
+    """
+    source_path = VLM_EXPORT / "export_vision.py"
+    source = source_path.read_text(encoding="utf-8")
+    old = "image_hidden_states = self.vpm(pixel_values).last_hidden_state"
+    new = """image_hidden_states = self.vpm.embeddings(pixel_values=pixel_values)
+        image_hidden_states = self.vpm.encoder(
+            inputs_embeds=image_hidden_states, attention_mask=None
+        ).last_hidden_state
+        image_hidden_states = self.vpm.post_layernorm(image_hidden_states)"""
+    if old not in source:
+        raise SystemExit(
+            "The upstream SmolVLM exporter changed; cannot apply the temporary "
+            "Transformers compatibility patch."
+        )
+    source = source.replace(old, new, 1)
+    temp = tempfile.TemporaryDirectory(prefix="rkllm-smolvlm-")
+    patched = Path(temp.name) / source_path.name
+    patched.write_text(source, encoding="utf-8")
+    return temp, patched
 
 
 def export_vlm_vision(args: argparse.Namespace, model: Path, output_dir: Path,
@@ -384,9 +591,32 @@ def export_vlm_vision(args: argparse.Namespace, model: Path, output_dir: Path,
         run_onnx = run_onnx and export_onnx
     run_rknn = args.vision_stage in ("all", "rknn") and (args.force or not copied_rknn.exists())
     if run_onnx:
-        run([sys.executable, str(launcher), "--stage", "onnx", "--script", str(VLM_EXPORT / "export_vision.py"),
-         "--path", str(model), "--model_name", model_name,
-         "--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width), "--device", args.vision_device], VLM_EXPORT)
+        if model_name == "qwen2-vl":
+            # The upstream Qwen2-VL exporter needs a preparation pass for
+            # rotary_pos_emb and cu_seqlens. Keep its temporary numpy files in
+            # a disposable directory and leave the generated SDK untouched.
+            with tempfile.TemporaryDirectory(prefix="rkllm-qwen2vl-") as temp:
+                legacy = VLM_EXPORT / "export_vision_qwen2.py"
+                run([sys.executable, str(legacy), "--step", "1",
+                     "--path", str(model), "--batch", str(args.batch_size),
+                     "--height", str(args.height), "--width", str(args.width)], Path(temp))
+                run([sys.executable, str(legacy), "--step", "0",
+                     "--path", str(model), "--batch", str(args.batch_size),
+                     "--height", str(args.height), "--width", str(args.width),
+                     "--savepath", str(onnx)], Path(temp))
+        else:
+            script = VLM_EXPORT / "export_vision.py"
+            smol_temp = None
+            if model_name == "smolvlm":
+                smol_temp, script = smolvlm_export_script()
+            try:
+                with deepseekocr_model_view(model) as export_model:
+                    run([sys.executable, str(launcher), "--stage", "onnx", "--script", str(script),
+                 "--path", str(export_model), "--model_name", model_name,
+                 "--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width), "--device", args.vision_device], VLM_EXPORT)
+            finally:
+                if smol_temp is not None:
+                    smol_temp.cleanup()
     elif run_rknn and not onnx.exists():
         if copied_onnx.exists():
             onnx.parent.mkdir(parents=True, exist_ok=True)
@@ -394,9 +624,12 @@ def export_vlm_vision(args: argparse.Namespace, model: Path, output_dir: Path,
         else:
             raise SystemExit(f"Cannot build RKNN: source ONNX does not exist: {onnx}")
     if run_rknn:
-        run([sys.executable, str(launcher), "--stage", "rknn", "--script", str(VLM_EXPORT / "export_vision_rknn.py"),
-         "--path", str(onnx), "--model_name", model_name,
-         "--target-platform", platform.lower(), "--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width)], VLM_EXPORT)
+        if model_name == "qwen2-vl":
+            export_qwen2_vl_rknn(onnx, rknn, args, platform)
+        else:
+            run([sys.executable, str(launcher), "--stage", "rknn", "--script", str(VLM_EXPORT / "export_vision_rknn.py"),
+             "--path", str(onnx), "--model_name", model_name,
+             "--target-platform", platform.lower(), "--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width)], VLM_EXPORT)
     if run_onnx:
         if not onnx.is_file():
             raise SystemExit(f"Vision exporter did not create ONNX output: {onnx}")
@@ -451,11 +684,22 @@ def main() -> int:
     if args.kind == "vlm" and (args.prepare_dataset or (language_pending and args.dtype != "fp")) and dataset is not None and dataset.exists() and not args.force:
         print(f"Skipping existing calibration dataset: {dataset}")
     elif args.kind == "vlm" and (args.prepare_dataset or (language_pending and args.dtype != "fp")) and dataset is not None:
-        model_type = infer_dataset_model_type(model, args.model_type)
-        run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
-        generated = VLM_DATA / "llm_inputs.json"
-        dataset.parent.mkdir(parents=True, exist_ok=True)
-        make_vlm_dataset_paths_absolute(generated, dataset, VLM_DATA)
+        model_name = infer_vlm_model_name(model, args.model_name)
+        if model_name == "deepseekocr":
+            with deepseekocr_model_view(model) as calibration_model:
+                run([
+                    sys.executable,
+                    str(TOOLS / "make_deepseekocr_input_embeds.py"),
+                    "--path", str(calibration_model), "--output", str(dataset),
+                    "--height", str(args.height), "--width", str(args.width),
+                    "--device", args.vision_device,
+                ], ROOT)
+        else:
+            model_type = infer_dataset_model_type(model, args.model_type)
+            run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
+            generated = VLM_DATA / "llm_inputs.json"
+            dataset.parent.mkdir(parents=True, exist_ok=True)
+            make_vlm_dataset_paths_absolute(generated, dataset, VLM_DATA)
     elif args.kind == "vlm" and dataset is not None and dataset.parent == model_output:
         # Repair manifests created by an earlier wrapper version. Keep the
         # sample files in the example data directory, outside the output tree.

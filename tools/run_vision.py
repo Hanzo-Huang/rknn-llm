@@ -57,6 +57,24 @@ def main() -> None:
                 "return self.vpm(flatten_patches, grid_thw)",
                 "return self.vpm(flatten_patches, grid_thw).pooler_output",
             )
+        if "deepseekocr" in sys.argv:
+            marker = "        pixel_values = torch.randn(args.batch_size, 3, args.height, args.width, device=model.device, dtype=torch.float32)\n        model = deepseekocr_vision(model.model)"
+            replacement = '''        # Rebuild deterministic position IDs omitted from the checkpoint.
+        for vision_module in model.modules():
+            position_ids = getattr(vision_module, "position_ids", None)
+            num_positions = getattr(vision_module, "num_positions", None)
+            if isinstance(position_ids, torch.Tensor) and isinstance(num_positions, int):
+                vision_module.position_ids = torch.arange(
+                    num_positions, device=position_ids.device
+                ).expand((1, -1))
+        pixel_values = torch.randn(args.batch_size, 3, args.height, args.width, device=model.device, dtype=torch.float32)
+        model = deepseekocr_vision(model.model)'''
+            if marker not in source:
+                raise SystemExit(
+                    "The upstream DeepSeek-OCR exporter changed; cannot apply "
+                    "the compatibility patch."
+                )
+            source = source.replace(marker, replacement, 1)
         exec(compile(source, str(script), "exec"), {"__name__": "__main__", "__file__": str(script)})
     else:
         patch_onnx()
