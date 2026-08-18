@@ -1,4 +1,45 @@
 /models/
 /output/
+
+# Python caches and local environments
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Native build output
+build/
+install/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Generated model and calibration artifacts
+*.onnx
+*.rknn
+*.rkllm
+*.safetensors
+*.gguf
+*.pt
+*.pth
+pytorch_model*.bin
+llm_inputs/
+llm_inputs.json
+inputs.json
+rotary_pos_emb.npy
+cu_seqlens.npy
+img_vec.bin
+
+# Editors and operating systems
+.idea/
+.vscode/
 .DS_Store
+Thumbs.db
+*.swp
+*~
