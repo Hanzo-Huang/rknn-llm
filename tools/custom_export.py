@@ -287,6 +287,46 @@ def deepseekocr_model_view(model: Path):
             "        return hasattr(torch, 'fx')",
             1,
         )
+    cache_import = "from transformers.cache_utils import Cache, DynamicCache"
+    cache_compatibility = cache_import + """
+
+# DeepSeek-OCR's language code uses the Transformers 4 cache API. RKLLM 1.3
+# installs Transformers 5, which removed these legacy conversion helpers.
+if not hasattr(DynamicCache, "from_legacy_cache"):
+    @classmethod
+    def _from_legacy_cache(cls, past_key_values=None):
+        return cls(past_key_values) if past_key_values else cls()
+
+    def _to_legacy_cache(self):
+        return tuple(
+            (layer.keys, layer.values)
+            for layer in self.layers
+            if getattr(layer, "is_initialized", False)
+        )
+
+    def _get_usable_length(self, new_seq_length, layer_idx=0):
+        return self.get_seq_length(layer_idx)
+
+    @property
+    def _seen_tokens(self):
+        return self.get_seq_length()
+
+    def _get_max_length(self):
+        return None
+
+    DynamicCache.from_legacy_cache = _from_legacy_cache
+    DynamicCache.to_legacy_cache = _to_legacy_cache
+    DynamicCache.get_usable_length = _get_usable_length
+    DynamicCache.seen_tokens = _seen_tokens
+    DynamicCache.get_max_length = _get_max_length
+"""
+    if cache_import not in modeling:
+        raise SystemExit("Rockchip DeepSeek cache import has an unexpected layout")
+    modeling = modeling.replace(cache_import, cache_compatibility, 1)
+    modeling = modeling.replace(
+        "past_key_values.get_seq_length(seq_length)",
+        "past_key_values.get_seq_length()",
+    )
 
     config_path = model / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
