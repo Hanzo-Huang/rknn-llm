@@ -107,7 +107,9 @@ def platform_name(value: str) -> str:
     return normalized
 
 
-def conversion_matrix(platform: str, dtype: str | None) -> list[tuple[str, str]]:
+def conversion_matrix(
+    platform: str, dtype: str | None, *, grouped_w4: bool = True
+) -> list[tuple[str, str]]:
     """Return (platform, dtype) pairs for the requested conversion.
 
     Omitting ``--dtype`` with ``--platform ALL`` is the common batch workflow:
@@ -119,7 +121,7 @@ def conversion_matrix(platform: str, dtype: str | None) -> list[tuple[str, str]]
         return [(target, dtype) for target in PLATFORMS]
     return [
         ("RK3588", "w8a8"),
-        ("RK3576", "w4a16_g128"),
+        ("RK3576", "w4a16_g128" if grouped_w4 else "w4a16"),
         ("RK3576", "w8a8"),
     ]
 
@@ -697,7 +699,17 @@ def main() -> int:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     model = Path(args.model).expanduser().resolve() if Path(args.model).exists() else Path(args.model)
     platform = platform_name(args.platform)
-    matrix = conversion_matrix(platform, args.dtype)
+    normalized_model = str(model).lower().replace("-", "_")
+    is_deepseekocr = args.kind == "vlm" and (
+        args.model_name == "deepseekocr"
+        or "deepseek_ocr" in normalized_model
+        or "deepseekocr" in normalized_model
+    )
+    # DeepSeek-OCR contains a tensor dimension that is not divisible by 128.
+    # Keep the three-build ALL workflow, but use ungrouped W4 on RK3576.
+    matrix = conversion_matrix(
+        platform, args.dtype, grouped_w4=not is_deepseekocr
+    )
     output_root = (Path(args.output_dir).expanduser().resolve()
                    if args.output_dir else model_output_dir(model))
     language_outputs = [

@@ -112,6 +112,11 @@ by default. `--output-dir` overrides this common output root for calibration,
 vision, and language artifacts. VLM vision export uses `cuda` by default; use
 `--vision-device cpu` only when GPU export is unavailable.
 
+With `--platform ALL`, DeepSeek-OCR uses ungrouped `w4a16` instead of
+`w4a16_g128` on RK3576 because one of its tensor dimensions is not divisible
+by a group size of 128. Its other default builds remain RK3576 `w8a8` and
+RK3588 `w8a8`.
+
 ```bash
 python tools/custom_export.py --kind vlm \
   --model /models/Qwen2.5-VL-3B-Instruct \
