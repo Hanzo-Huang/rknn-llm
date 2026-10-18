@@ -1,4 +1,14 @@
 # CHANGELOG
+
+## Custom converter update for v1.3.1
+
+- Merged upstream `release-v1.3.1`, retaining the fork's converter on `dev`.
+- Added RK3562/RV1126B, explicit Jetson CUDA export, platform-specific dtype validation, and `--dtype all` (19 Rockchip platform/dtype builds).
+- Added GGUF loading, SDK LoRA correction algorithm options, cached qparams paths, and tokenizer/embedding export switches.
+- Added legacy Qwen2-VL two-step vision export and Gemma4 vision/audio encoder routes.
+- Preserved ONNX external tensors, isolated generated multimodal calibration samples, and stopped regenerating explicitly supplied manifests.
+- Added mocked API/routing regression tests and Python 3.10–3.12 CI. Real conversion and hardware inference remain to be verified on Linux.
+
 ## v1.3.1
 
 - Added support for LFM2.5-VL-450M and Spark-X2.5 models.

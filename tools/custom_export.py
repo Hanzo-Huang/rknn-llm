@@ -12,6 +12,7 @@ import argparse
 from contextlib import contextmanager, ExitStack
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,20 +25,26 @@ ROOT = Path(__file__).resolve().parents[1]
 LLM_EXPORT = ROOT / "examples" / "rkllm_api_demo" / "export"
 VLM_EXPORT = ROOT / "examples" / "multimodal_model_demo" / "export"
 VLM_DATA = ROOT / "examples" / "multimodal_model_demo" / "data"
-PLATFORMS = ("RK3576", "RK3588")
-DTYPES = (
-    "fp",
-    "w4a16",
-    "w4a16_g32",
-    "w4a16_g64",
-    "w4a16_g128",
-    "w8a8",
-    "w8a8_g128",
-    "w8a8_g256",
-    "w8a8_g512",
-)
-DEFAULT_DTYPES = {"RK3576": "w4a16", "RK3588": "w8a8"}
-VLM_MODELS = ("minicpm-v-2_6", "qwen2_5-vl-3b", "qwen3-vl", "qwen3.5", "smolvlm", "internvl3-1b", "deepseekocr")
+# RKLLM 1.3.1 SDK manual, section 3.1.3, and rkllm/api/rkllm.py.
+W4 = ("w4a16", "w4a16_g32", "w4a16_g64", "w4a16_g128")
+PLATFORM_DTYPES = {
+    "RK3576": (*W4, "w8a8"),
+    "RK3588": ("w8a8", "w8a8_g128", "w8a8_g256", "w8a8_g512"),
+    "RK3562": ("w8a8", *W4[1:], "w4a8_g32"),
+    "RV1126B": (*W4, "w8a8"),
+    "CUDA": ("w4a16_g32",),  # Jetson; explicit target, excluded from ALL.
+}
+PLATFORMS = tuple(target for target in PLATFORM_DTYPES if target != "CUDA")
+DTYPES = ("fp", *dict.fromkeys(dtype for values in PLATFORM_DTYPES.values() for dtype in values), "all")
+DEFAULT_DTYPES = {"RK3576": "w4a16_g128", "RK3588": "w8a8",
+                  "RK3562": "w8a8", "RV1126B": "w4a16_g128", "CUDA": "w4a16_g32"}
+VLM_MODELS = ("minicpm-v-2_6", "qwen2-vl", "qwen2_5-vl-3b", "qwen3-vl", "qwen3.5", "smolvlm", "internvl3-1b", "deepseekocr", "gemma-4")
+
+
+def quantization_algorithm(value: str) -> str:
+    if not re.fullmatch(r"(?:normal|grq)(?:_r(?:[1-9]|[1-5][0-9]|6[0-4]))?|none", value):
+        raise argparse.ArgumentTypeError("choose none, normal, grq, normal_r1..64, or grq_r1..64")
+    return value
 
 
 def positive_int(value: str) -> int:
@@ -58,8 +65,8 @@ def context_length(value: str) -> int:
 
 def unit_interval(value: str) -> float:
     result = float(value)
-    if not 0 <= result <= 1:
-        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    if not 0 <= result < 1:
+        raise argparse.ArgumentTypeError("must be at least 0 and less than 1")
     return result
 
 
@@ -69,8 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kind", choices=("llm", "vlm"), default="llm", help="conversion type (default: llm)")
     parser.add_argument("-m", "--model", required=True, help="Hugging Face model ID or local model directory")
-    parser.add_argument("-p", "--platform", default="RK3588", help="target platform, RK3576, RK3588, or ALL (default: RK3588)")
-    parser.add_argument("-q", "--dtype", choices=DTYPES, default=None, help="quantization type (default: w4a16 for RK3576, w8a8 for RK3588; with --platform ALL, omitted uses the supported platform matrix; fp disables quantization)")
+    parser.add_argument("--format", choices=("auto", "huggingface", "gguf"), default="auto", help="input format; auto detects .gguf files")
+    parser.add_argument("-p", "--platform", default="RK3588", help="target: RK3576, RK3588, RK3562, RV1126B, CUDA (Jetson), or ALL Rockchip targets")
+    parser.add_argument("-q", "--dtype", choices=DTYPES, default=None, help="quantization type; all builds every supported quantized dtype per target; fp disables quantization")
     parser.add_argument("--dataset", default=None, help="RKLLM calibration dataset; generated when omitted for quantized conversion")
     parser.add_argument("-o", "--output", default=None, help="output .rkllm path; with ALL, used as the fan-out base path")
     parser.add_argument("--output-dir", default=None, help="common output directory for calibration and model artifacts (default: output/<model>)")
@@ -78,12 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-dtype", choices=("float32", "float16", "bfloat16"), default="float32")
     parser.add_argument("--model-lora", default=None, help="optional LoRA model path")
     parser.add_argument("--custom-config", default=None, help="JSON file passed as RKLLM custom_config")
-    parser.add_argument("-O", "--optimization-level", type=int, choices=(0, 1, 2), default=1)
+    parser.add_argument("-O", "--optimization-level", type=int, choices=(0, 1), default=1)
     parser.add_argument("-c", "--max-context", type=context_length, default=4096, help="maximum context length (a multiple of 32, up to 16384)")
     parser.add_argument("--num-npu-core", type=positive_int, default=None)
-    parser.add_argument("--quantized-algorithm", choices=("normal", "grq"), default=None)
+    parser.add_argument("--quantized-algorithm", type=quantization_algorithm, default=None)
     parser.add_argument("--hybrid-rate", type=unit_interval, default=0)
-    parser.add_argument("--extra-qparams", default=None, help="JSON file or JSON object passed as extra_qparams")
+    parser.add_argument("--extra-qparams", default=None, help="cached .qparams path, JSON file, or inline JSON object")
     parser.add_argument("--cuda-visible-devices", default=None, help="optional CUDA device mask, for example 0 or 1")
     parser.add_argument("--model-name", choices=VLM_MODELS, default=None, help="VLM vision wrapper name (auto-detected when omitted)")
     parser.add_argument("--model-type", choices=("qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3.5"), default=None, help="used with --prepare-dataset")
@@ -95,43 +103,63 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vision-stage", choices=("all", "onnx", "rknn"), default="all", help="VLM vision artifact to generate (default: all)")
     parser.add_argument("--vision-only", action="store_true", help="for VLM, do not export the language RKLLM component")
     parser.add_argument("--skip-vision", action="store_true", help="for VLM, export only the RKLLM language component")
+    parser.add_argument("--audio", action="store_true", help="also export the Gemma4 audio encoder (with --kind vlm)")
+    parser.add_argument("--audio-only", action="store_true", help="export only the Gemma4 audio encoder")
+    parser.add_argument("--audio-stage", choices=("all", "onnx", "rknn"), default="all")
+    parser.add_argument("--no-export-tokenizer", action="store_true")
+    parser.add_argument("--no-export-embedding", action="store_true")
     parser.add_argument("--force", "--overwrite", dest="force", action="store_true", help="rebuild and overwrite existing artifacts")
     return parser
 
 
 def platform_name(value: str) -> str:
     normalized = value.upper()
-    if normalized not in (*PLATFORMS, "ALL"):
-        raise SystemExit(f"Unsupported platform: {value}. Choose RK3576, RK3588, or ALL.")
+    if normalized not in (*PLATFORM_DTYPES, "ALL"):
+        raise SystemExit(f"Unsupported platform: {value}. Choose {', '.join(PLATFORM_DTYPES)}, or ALL.")
     return normalized
 
 
 def conversion_matrix(platform: str, dtype: str | None) -> list[tuple[str, str]]:
-    """Return (platform, dtype) pairs for the requested conversion.
-
-    Omitting ``--dtype`` with ``--platform ALL`` is the common batch workflow:
-    one calibration dataset feeds these three builds.
-    """
-    if platform != "ALL":
-        return [(platform, dtype or DEFAULT_DTYPES.get(platform, "w8a8"))]
-    if dtype is not None:
-        return [(target, dtype) for target in PLATFORMS]
-    return [
-        ("RK3588", "w8a8"),
-        ("RK3576", "w4a16_g128"),
-        ("RK3576", "w8a8"),
-    ]
+    targets = PLATFORMS if platform == "ALL" else (platform,)
+    result = []
+    for target in targets:
+        if dtype == "all":
+            dtypes = PLATFORM_DTYPES[target]
+        elif dtype is not None:
+            dtypes = (dtype,)
+        elif platform == "ALL" and target != "RK3588":
+            dtypes = ("w4a16_g128", "w8a8")
+        else:
+            dtypes = (DEFAULT_DTYPES[target],)
+        for quantization in dtypes:
+            if quantization != "fp" and quantization not in PLATFORM_DTYPES[target]:
+                raise SystemExit(f"{target} does not support {quantization}; choose {', '.join(PLATFORM_DTYPES[target])}, or fp")
+            if target == "CUDA" and quantization == "fp":
+                raise SystemExit("CUDA supports only w4a16_g32")
+            result.append((target, quantization))
+    return result
 
 
 def core_count(platform: str, explicit: int | None) -> int:
-    maximum = {"RK3576": 2, "RK3588": 3}.get(platform.upper())
-    if maximum is None:
-        raise SystemExit(f"Unsupported platform: {platform}")
+    maximum = {"RK3576": 2, "RK3588": 3, "RK3562": 1, "RV1126B": 1, "CUDA": 1}[platform.upper()]
     if explicit is not None:
-        if explicit > maximum:
-            raise SystemExit(f"{platform} supports at most {maximum} NPU cores")
+        if not 1 <= explicit <= maximum:
+            raise SystemExit(f"{platform} supports 1..{maximum} NPU cores")
         return explicit
     return maximum
+
+
+def input_format(args: argparse.Namespace) -> str:
+    return ("gguf" if args.model.lower().endswith(".gguf") else "huggingface") if args.format == "auto" else args.format
+
+
+def qparams_value(value: str | None) -> Any:
+    if value and Path(value).expanduser().suffix == ".qparams":
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(f"Quantization cache does not exist: {path}")
+        return str(path)
+    return read_json(value)
 
 
 def read_json(value: str | None) -> Any:
@@ -241,8 +269,17 @@ def validate_calibration_dataset(dataset: Path) -> None:
         records = json.loads(dataset.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"Calibration dataset is not valid JSON: {dataset}") from error
-    if not isinstance(records, list):
-        raise SystemExit(f"Calibration dataset must be a JSON list: {dataset}")
+    if not isinstance(records, list) or not records or any(not isinstance(record, dict) for record in records):
+        raise SystemExit(f"Calibration dataset must be a nonempty JSON list of objects: {dataset}")
+    for record in records:
+        if "sample" in record:
+            sample = Path(record["sample"])
+            if not sample.is_absolute():
+                sample = dataset.parent / sample
+            if not sample.is_file():
+                raise SystemExit(f"Calibration sample does not exist: {sample}")
+        elif not isinstance(record.get("input"), str):
+            raise SystemExit(f"Calibration record must contain input text or a sample path: {dataset}")
 
 
 def default_output(model: Path, dtype: str, platform: str,
@@ -304,19 +341,24 @@ def export_rkllm(args: argparse.Namespace, model: Path, dataset: Path | None,
         raise SystemExit("A calibration dataset is required for quantized conversion; pass --dataset.")
 
     load_config = read_json(args.custom_config)
-    extra_qparams = read_json(args.extra_qparams)
+    extra_qparams = qparams_value(args.extra_qparams)
     quantized = dtype != "fp"
-    algorithm = args.quantized_algorithm or ("grq" if dtype.startswith("w4") else "normal")
+    algorithm = args.quantized_algorithm or ("grq" if dtype.startswith("w4a16") else "normal")
     llm = RKLLM()
     with ExitStack() as stack:
         load_model = stack.enter_context(rkllm_model_view(model))
         print(f"Loading model: {model}")
-        ret = llm.load_huggingface(
-            model=str(load_model), model_lora=args.model_lora, device=args.device,
-            dtype=args.load_dtype, custom_config=load_config, load_weight=True,
-        )
+        if input_format(args) == "gguf":
+            ret = llm.load_gguf(model=str(load_model))
+            operation = "load_gguf"
+        else:
+            ret = llm.load_huggingface(
+                model=str(load_model), model_lora=args.model_lora, device=args.device,
+                dtype=args.load_dtype, custom_config=load_config, load_weight=True,
+            )
+            operation = "load_huggingface"
         if ret != 0:
-            raise RuntimeError(f"load_huggingface failed with status {ret}")
+            raise RuntimeError(f"{operation} failed with status {ret}")
         # Older RKLLM releases validate quantized_dtype even when quantization is
         # disabled.  Keep the user-facing `fp` spelling while using a harmless
         # toolkit-compatible value internally.
@@ -330,7 +372,8 @@ def export_rkllm(args: argparse.Namespace, model: Path, dataset: Path | None,
         )
         if ret != 0:
             raise RuntimeError(f"build failed with status {ret}")
-        ret = llm.export_rkllm(str(output))
+        ret = llm.export_rkllm(str(output), export_tokenizer=not args.no_export_tokenizer,
+                               export_embedding=not args.no_export_embedding)
         if ret != 0:
             raise RuntimeError(f"export_rkllm failed with status {ret}")
     print(f"Wrote: {output}")
@@ -342,6 +385,8 @@ def infer_vlm_model_name(model: Path, explicit: str | None) -> str:
         return explicit
     name = str(model).lower().replace("-", "_")
     aliases = (
+        ("gemma_4", "gemma-4"), ("gemma4", "gemma-4"),
+        ("qwen2_vl", "qwen2-vl"),
         ("qwen3.5", "qwen3.5"), ("qwen3_5", "qwen3.5"),
         ("qwen3_vl", "qwen3-vl"), ("qwen2.5_vl", "qwen2_5-vl-3b"),
         ("qwen2_5_vl", "qwen2_5-vl-3b"), ("minicpm_v_2_6", "minicpm-v-2_6"),
@@ -358,130 +403,203 @@ def infer_dataset_model_type(model: Path, explicit: str | None) -> str:
     if explicit:
         return explicit
     name = str(model).lower().replace("-", "_")
+    if "qwen2_vl" in name:
+        return "qwen2vl"
     if "qwen3.5" in name or "qwen3_5" in name:
         return "qwen3.5"
     if "qwen3_vl" in name:
         return "qwen3vl"
     if "qwen2.5_vl" in name or "qwen2_5_vl" in name:
         return "qwen2.5vl"
-    raise SystemExit("Could not detect VLM calibration model type; pass --model-type explicitly.")
+    raise SystemExit("No automatic calibration helper for this VLM. Pass --dataset with a prepared multimodal manifest; --model-type selects Qwen helpers only.")
+
+
+def copy_onnx(source: Path, destination: Path) -> None:
+    """Copy a graph together with external tensor files (large vision models)."""
+    import onnx
+
+    graph = onnx.load(str(source), load_external_data=False)
+    locations = set()
+
+    def collect(message):
+        # Walk protobuf fields to include tensors inside subgraphs/attributes.
+        if message.DESCRIPTOR.full_name == "onnx.TensorProto":
+            locations.update(entry.value for entry in message.external_data if entry.key == "location")
+        for field, value in message.ListFields():
+            if field.message_type is not None:
+                if field.label == field.LABEL_REPEATED:
+                    for child in value:
+                        collect(child)
+                else:
+                    collect(value)
+
+    collect(graph)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for location in locations:
+        relative = Path(location)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise SystemExit(f"Unsafe ONNX external data location: {location}")
+        target = destination.parent / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if (source.parent / relative).resolve() != target.resolve():
+            shutil.copy2(source.parent / relative, target)
+    if source.resolve() != destination.resolve():
+        shutil.copy2(source, destination)
 
 
 def export_vlm_vision(args: argparse.Namespace, model: Path, output_dir: Path,
                       platform: str, export_onnx: bool | None = None) -> tuple[Path, Path]:
     model_name = infer_vlm_model_name(model, args.model_name)
-    onnx = VLM_EXPORT / "onnx" / f"{model_name}_vision.onnx"
-    rknn = VLM_EXPORT / "rknn" / f"{model_name}_vision_{platform.lower()}.rknn"
+    onnx = output_dir.parent / f"{model.name}_vision.onnx"
+    rknn = output_dir / f"{model.name}_vision_{platform}.rknn"
     launcher = ROOT / "tools" / "run_vision.py"
     output_dir.mkdir(parents=True, exist_ok=True)
-    onnx_dir = output_dir.parent
-    onnx_dir.mkdir(parents=True, exist_ok=True)
-    copied_onnx = onnx_dir / f"{model.name}_vision.onnx"
-    copied_rknn = output_dir / f"{model.name}_vision_{platform}.rknn"
-
-    run_onnx = args.vision_stage in ("all", "onnx") and (args.force or not copied_onnx.exists())
+    run_onnx = args.vision_stage in ("all", "onnx") and (args.force or not onnx.is_file())
     if export_onnx is not None:
         run_onnx = run_onnx and export_onnx
-    run_rknn = args.vision_stage in ("all", "rknn") and (args.force or not copied_rknn.exists())
+    run_rknn = args.vision_stage in ("all", "rknn") and (args.force or not rknn.is_file())
     if run_onnx:
-        run([sys.executable, str(launcher), "--stage", "onnx", "--script", str(VLM_EXPORT / "export_vision.py"),
-         "--path", str(model), "--model_name", model_name,
-         "--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width), "--device", args.vision_device], VLM_EXPORT)
-    elif run_rknn and not onnx.exists():
-        if copied_onnx.exists():
-            onnx.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(copied_onnx, onnx)
+        dimensions = ["--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width)]
+        if model_name == "gemma-4":
+            run([sys.executable, str(VLM_EXPORT / "export_vision_gemma4.py"),
+                 "--model_path", str(model), "--export_vision_path", str(onnx), *dimensions,
+                 "--device", args.vision_device], VLM_EXPORT)
+        elif model_name == "qwen2-vl":
+            for step in (1, 2):
+                run([sys.executable, str(launcher), "--stage", "onnx", "--script", str(VLM_EXPORT / "export_vision_qwen2.py"),
+                     "--step", str(step), "--path", str(model), "--savepath", str(onnx),
+                     "--batch", str(args.batch_size), "--height", str(args.height), "--width", str(args.width)], VLM_EXPORT)
         else:
-            raise SystemExit(f"Cannot build RKNN: source ONNX does not exist: {onnx}")
-    if run_rknn:
-        run([sys.executable, str(launcher), "--stage", "rknn", "--script", str(VLM_EXPORT / "export_vision_rknn.py"),
-         "--path", str(onnx), "--model_name", model_name,
-         "--target-platform", platform.lower(), "--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width)], VLM_EXPORT)
-    if run_onnx:
+            generated = VLM_EXPORT / "onnx" / f"{model_name}_vision.onnx"
+            run([sys.executable, str(launcher), "--stage", "onnx", "--script", str(VLM_EXPORT / "export_vision.py"),
+                 "--path", str(model), "--model_name", model_name, *dimensions, "--device", args.vision_device], VLM_EXPORT)
+            copy_onnx(generated, onnx)
+    if args.vision_stage in ("all", "onnx") or run_rknn:
         if not onnx.is_file():
-            raise SystemExit(f"Vision exporter did not create ONNX output: {onnx}")
-        shutil.copy2(onnx, copied_onnx)
-        print(f"Wrote: {copied_onnx}")
+            raise SystemExit(f"Vision ONNX is unavailable: {onnx}; run --vision-stage onnx first")
     if run_rknn:
-        if not rknn.is_file():
-            raise SystemExit(f"Vision exporter did not create RKNN output: {rknn}")
-        shutil.copy2(rknn, copied_rknn)
-        print(f"Wrote: {copied_rknn}")
-    elif args.vision_stage in ("all", "rknn") and copied_rknn.exists():
-        print(f"Skipping existing: {copied_rknn}")
-    if not run_onnx and args.vision_stage in ("all", "onnx") and copied_onnx.exists():
-        print(f"Skipping existing: {copied_onnx}")
-    if args.vision_stage in ("all", "onnx") and not copied_onnx.is_file():
-        raise SystemExit(f"ONNX artifact is unavailable: {copied_onnx}")
-    if args.vision_stage in ("all", "rknn") and not copied_rknn.is_file():
-        raise SystemExit(f"RKNN artifact is unavailable: {copied_rknn}")
-    return copied_onnx, copied_rknn
+        run([sys.executable, str(launcher), "--stage", "rknn", "--script", str(ROOT / "tools" / "export_encoder_rknn.py"),
+             "--path", str(onnx), "--model_name", model_name, "--output", str(rknn),
+             "--target-platform", platform.lower(), "--batch_size", str(args.batch_size),
+             "--height", str(args.height), "--width", str(args.width)], VLM_EXPORT)
+    if args.vision_stage in ("all", "rknn") and not rknn.is_file():
+        raise SystemExit(f"Vision RKNN is unavailable: {rknn}")
+    return onnx, rknn
+
+
+def export_audio(args: argparse.Namespace, model: Path, output_root: Path, platform: str,
+                 export_onnx: bool) -> None:
+    onnx = output_root / f"{model.name}_audio.onnx"
+    rknn = output_root / platform / f"{model.name}_audio_{platform}.rknn"
+    if export_onnx and args.audio_stage in ("all", "onnx") and (args.force or not onnx.is_file()):
+        run([sys.executable, str(VLM_EXPORT / "export_audio_gemma4.py"),
+             "--model_path", str(model), "--export_audio_path", str(onnx)], VLM_EXPORT)
+        if not onnx.is_file():
+            raise SystemExit(f"Audio exporter did not create: {onnx}")
+    if args.audio_stage in ("all", "rknn") and (args.force or not rknn.is_file()):
+        if not onnx.is_file():
+            raise SystemExit(f"Cannot build audio RKNN: source ONNX does not exist: {onnx}")
+        rknn.parent.mkdir(parents=True, exist_ok=True)
+        run([sys.executable, str(ROOT / "tools" / "export_encoder_rknn.py"),
+             "--path", str(onnx), "--model_name", "gemma-4-audio",
+             "--target-platform", platform.lower(), "--output", str(rknn)], VLM_EXPORT)
+
+
+def validate_options(args: argparse.Namespace, model: Path, matrix: list[tuple[str, str]]) -> None:
+    if args.vision_only and args.skip_vision:
+        raise SystemExit("--vision-only cannot be combined with --skip-vision")
+    if args.kind != "vlm" and any((args.audio, args.audio_only, args.vision_only, args.skip_vision, args.prepare_dataset)):
+        raise SystemExit("vision/audio and multimodal calibration options require --kind vlm")
+    if args.audio_only and (args.vision_only or args.prepare_dataset):
+        raise SystemExit("--audio-only cannot be combined with --vision-only or --prepare-dataset")
+    if args.kind == "vlm":
+        if any(target == "CUDA" for target, _ in matrix):
+            raise SystemExit("VLM encoder conversion requires a Rockchip target")
+        if not args.skip_vision and not args.audio_only:
+            name = infer_vlm_model_name(model, args.model_name)
+            if name == "gemma-4" and args.batch_size != 1:
+                raise SystemExit("The upstream Gemma4 vision exporter supports batch size 1")
+            alignment = 28 if name in ("qwen2-vl", "qwen2_5-vl-3b") else 32 if name in ("qwen3-vl", "qwen3.5") else 1
+            if args.height % alignment or args.width % alignment:
+                raise SystemExit(f"{name} image height and width must be multiples of {alignment}")
+        if args.audio or args.audio_only:
+            if infer_vlm_model_name(model, args.model_name) != "gemma-4":
+                raise SystemExit("The SDK provides an audio exporter only for Gemma4")
+    if input_format(args) == "gguf":
+        if args.kind != "llm" or args.model_lora or args.custom_config:
+            raise SystemExit("GGUF input requires --kind llm and does not accept Hugging Face LoRA/custom-config options")
+        if not model.is_file():
+            raise SystemExit("GGUF input must be a local .gguf file")
+    for target, dtype in matrix:
+        core_count(target, args.num_npu_core)
+        algorithm = args.quantized_algorithm or ("grq" if dtype.startswith("w4a16") else "normal")
+        if algorithm.startswith("grq") and dtype != "fp":
+            if not dtype.startswith("w4a16"):
+                raise SystemExit("GRQ supports only w4a16 and grouped w4a16")
+            if args.device != "cuda":
+                raise SystemExit("GRQ requires a CUDA GPU; use --device cuda or --quantized-algorithm normal")
+        if args.model_lora and "_r" in algorithm:
+            raise SystemExit("LoRA correction algorithms cannot be combined with --model-lora")
 
 
 def main() -> int:
     args = build_parser().parse_args()
     if args.cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
-    model = Path(args.model).expanduser().resolve() if Path(args.model).exists() else Path(args.model)
+    model = Path(args.model).expanduser()
+    if model.exists():
+        model = model.resolve()
     platform = platform_name(args.platform)
     matrix = conversion_matrix(platform, args.dtype)
-    output_root = (Path(args.output_dir).expanduser().resolve()
-                   if args.output_dir else model_output_dir(model))
-    language_outputs = [
-        requested_output(model, dtype, target_platform, args.output, len(matrix) > 1,
-                         output_root)
-        for target_platform, dtype in matrix
-    ]
-    language_pending = not args.vision_only and (
-        args.force or any(not output.exists() for output in language_outputs)
-    )
-    dataset = Path(args.dataset).expanduser().resolve() if args.dataset else None
-    model_output = output_root
-    if args.kind == "llm" and language_pending and dataset is None:
-        dataset = model_output / f"{model.name}_data_quant.json"
-        if args.dtype != "fp" and not dataset.exists():
-            dataset.parent.mkdir(parents=True, exist_ok=True)
-            run([sys.executable, str(LLM_EXPORT / "generate_data_quant.py"), "-m", str(model), "-o", str(dataset)], LLM_EXPORT)
-        elif args.dtype != "fp" and dataset.exists():
-            print(f"Skipping existing calibration dataset: {dataset}")
-    if args.kind == "vlm" and language_pending and dataset is None:
-        dataset = model_output / f"{model.name}_data_quant.json"
-    if args.kind == "vlm" and args.prepare_dataset and dataset is None:
-        dataset = model_output / f"{model.name}_data_quant.json"
-    if args.kind == "vlm" and (args.prepare_dataset or (language_pending and args.dtype != "fp")) and dataset is not None and dataset.exists() and not args.force:
-        print(f"Skipping existing calibration dataset: {dataset}")
-    elif args.kind == "vlm" and (args.prepare_dataset or (language_pending and args.dtype != "fp")) and dataset is not None:
-        model_type = infer_dataset_model_type(model, args.model_type)
-        run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
-        generated = VLM_DATA / "llm_inputs.json"
-        dataset.parent.mkdir(parents=True, exist_ok=True)
-        make_vlm_dataset_paths_absolute(generated, dataset, VLM_DATA)
-    elif args.kind == "vlm" and dataset is not None and dataset.parent == model_output:
-        # Repair manifests created by an earlier wrapper version. Keep the
-        # sample files in the example data directory, outside the output tree.
-        make_vlm_dataset_paths_absolute(dataset, dataset, VLM_DATA)
-    if language_pending and any(dtype != "fp" for _, dtype in matrix):
-        if dataset is None:
-            raise SystemExit("A calibration dataset is required for quantized conversion; pass --dataset.")
-        validate_calibration_dataset(dataset)
-    if args.kind == "vlm" and not args.skip_vision:
-        custom_vision_dir = output_root if args.output_dir else None
-        vision_platforms = list(dict.fromkeys(target for target, _ in matrix))
-        for index, vision_platform in enumerate(vision_platforms):
-            vision_dir = (custom_vision_dir / vision_platform if custom_vision_dir and platform == "ALL"
-                          else custom_vision_dir if custom_vision_dir else model_output / vision_platform)
-            export_vlm_vision(args, model, vision_dir, vision_platform,
-                              export_onnx=(index == 0 if platform == "ALL" else None))
-    if args.kind == "vlm" and args.vision_only:
-        return 0
-    for target_platform, dtype in matrix:
-        output = requested_output(model, dtype, target_platform, args.output, len(matrix) > 1,
-                                  output_root)
-        if output.exists() and not args.force:
+    validate_options(args, model, matrix)
+    read_json(args.custom_config)
+    qparams_value(args.extra_qparams)
+    output_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else model_output_dir(model)
+    outputs = [requested_output(model, dtype, target, args.output, len(matrix) > 1, output_root)
+               for target, dtype in matrix]
+    for output in outputs:
+        if output.is_file() and not args.force and not (args.vision_only or args.audio_only):
             print(f"Skipping existing: {output}")
-            continue
-        export_rkllm(args, model, dataset, output,
-                     platform_override=target_platform, dtype_override=dtype)
+    pending = [(target, dtype, output) for (target, dtype), output in zip(matrix, outputs)
+               if args.force or not output.is_file()]
+    if args.vision_only or args.audio_only:
+        pending = []
+    needs_calibration = any(dtype != "fp" for _, dtype, _ in pending)
+    dataset = Path(args.dataset).expanduser().resolve() if args.dataset else None
+    if needs_calibration or args.prepare_dataset:
+        if dataset is not None:
+            # Explicit manifests are user input: never overwrite or regenerate them.
+            validate_calibration_dataset(dataset)
+        else:
+            dataset = output_root / f"{model.name}_data_quant.json"
+            if not dataset.is_file() or args.prepare_dataset or args.force:
+                if input_format(args) == "gguf":
+                    raise SystemExit("Pass --dataset for quantized GGUF conversion; the text calibration helper requires a Hugging Face model")
+                if args.kind == "llm":
+                    dataset.parent.mkdir(parents=True, exist_ok=True)
+                    run([sys.executable, str(LLM_EXPORT / "generate_data_quant.py"), "-m", str(model), "-o", str(dataset)], LLM_EXPORT)
+                else:
+                    model_type = infer_dataset_model_type(model, args.model_type)
+                    run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
+                    sample_root = output_root / "calibration"
+                    shutil.copytree(VLM_DATA / "llm_inputs", sample_root / "llm_inputs", dirs_exist_ok=True)
+                    make_vlm_dataset_paths_absolute(VLM_DATA / "llm_inputs.json", dataset, sample_root)
+            validate_calibration_dataset(dataset)
+        if args.kind == "vlm":
+            # Resolve relative sample paths against the supplied manifest, not cwd.
+            resolved = output_root / f"{model.name}_resolved_calibration.json"
+            make_vlm_dataset_paths_absolute(dataset, resolved)
+            dataset = resolved
+    vision_platforms = list(dict.fromkeys(target for target, _ in matrix))
+    if args.kind == "vlm":
+        for index, target in enumerate(vision_platforms):
+            if not args.skip_vision and not args.audio_only:
+                export_vlm_vision(args, model, output_root / target, target, export_onnx=(index == 0))
+            if args.audio or args.audio_only:
+                export_audio(args, model, output_root, target, export_onnx=(index == 0))
+    for target, dtype, output in pending:
+        export_rkllm(args, model, dataset if dtype != "fp" else None, output,
+                     platform_override=target, dtype_override=dtype)
     return 0
 
 

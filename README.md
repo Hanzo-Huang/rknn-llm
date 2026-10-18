@@ -2,7 +2,7 @@
 
 > **Repository difference:** This checkout is based on the original
 > [airockchip/rknn-llm](https://github.com/airockchip/rknn-llm) repository and
-> adds a custom RKLLM v1.3.0 conversion wrapper for LLM and VLM models. The
+> adds a custom RKLLM v1.3.1 conversion wrapper for LLM, vision, and Gemma4 audio models. The
 > wrapper is available at [tools/custom_export.py](tools/custom_export.py); see
 > the [conversion guide](tools/README.md) for setup and usage.
 
