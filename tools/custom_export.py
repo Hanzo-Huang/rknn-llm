@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extra-qparams", default=None, help="cached .qparams path, JSON file, or inline JSON object")
     parser.add_argument("--cuda-visible-devices", default=None, help="optional CUDA device mask, for example 0 or 1")
     parser.add_argument("--model-name", choices=VLM_MODELS, default=None, help="VLM vision wrapper name (auto-detected when omitted)")
-    parser.add_argument("--model-type", choices=("qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3.5"), default=None, help="used with --prepare-dataset")
+    parser.add_argument("--model-type", choices=("qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3.5", "gemma4"), default=None, help="used with --prepare-dataset")
     parser.add_argument("--prepare-dataset", action="store_true", help="generate VLM calibration data using the upstream helper")
     parser.add_argument("--batch-size", type=positive_int, default=1)
     parser.add_argument("--height", type=positive_int, default=448)
@@ -403,6 +403,8 @@ def infer_dataset_model_type(model: Path, explicit: str | None) -> str:
     if explicit:
         return explicit
     name = str(model).lower().replace("-", "_")
+    if "gemma_4" in name or "gemma4" in name:
+        return "gemma4"
     if "qwen2_vl" in name:
         return "qwen2vl"
     if "qwen3.5" in name or "qwen3_5" in name:
@@ -461,7 +463,7 @@ def export_vlm_vision(args: argparse.Namespace, model: Path, output_dir: Path,
     if run_onnx:
         dimensions = ["--batch_size", str(args.batch_size), "--height", str(args.height), "--width", str(args.width)]
         if model_name == "gemma-4":
-            run([sys.executable, str(VLM_EXPORT / "export_vision_gemma4.py"),
+            run([sys.executable, str(launcher), "--stage", "onnx", "--script", str(VLM_EXPORT / "export_vision_gemma4.py"),
                  "--model_path", str(model), "--export_vision_path", str(onnx), *dimensions,
                  "--device", args.vision_device], VLM_EXPORT)
         elif model_name == "qwen2-vl":
@@ -580,10 +582,16 @@ def main() -> int:
                     run([sys.executable, str(LLM_EXPORT / "generate_data_quant.py"), "-m", str(model), "-o", str(dataset)], LLM_EXPORT)
                 else:
                     model_type = infer_dataset_model_type(model, args.model_type)
-                    run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
-                    sample_root = output_root / "calibration"
-                    shutil.copytree(VLM_DATA / "llm_inputs", sample_root / "llm_inputs", dirs_exist_ok=True)
-                    make_vlm_dataset_paths_absolute(VLM_DATA / "llm_inputs.json", dataset, sample_root)
+                    if model_type == "gemma4":
+                        run([sys.executable, str(ROOT / "tools/make_gemma4_calibration.py"),
+                             "--model", str(model), "--output", str(dataset), "--device", args.device,
+                             "--height", str((args.height + 47) // 48 * 48),
+                             "--width", str((args.width + 47) // 48 * 48)], ROOT)
+                    else:
+                        run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
+                        sample_root = output_root / "calibration"
+                        shutil.copytree(VLM_DATA / "llm_inputs", sample_root / "llm_inputs", dirs_exist_ok=True)
+                        make_vlm_dataset_paths_absolute(VLM_DATA / "llm_inputs.json", dataset, sample_root)
             validate_calibration_dataset(dataset)
         if args.kind == "vlm":
             # Resolve relative sample paths against the supplied manifest, not cwd.
