@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, ExitStack
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -94,8 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extra-qparams", default=None, help="cached .qparams path, JSON file, or inline JSON object")
     parser.add_argument("--cuda-visible-devices", default=None, help="optional CUDA device mask, for example 0 or 1")
     parser.add_argument("--model-name", choices=VLM_MODELS, default=None, help="VLM vision wrapper name (auto-detected when omitted)")
-    parser.add_argument("--model-type", choices=("qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3.5", "gemma4"), default=None, help="used with --prepare-dataset")
-    parser.add_argument("--prepare-dataset", action="store_true", help="generate VLM calibration data using the upstream helper")
+    parser.add_argument("--model-type", choices=("qwen2vl", "qwen2.5vl", "qwen3vl", "qwen3.5", "gemma4"), default=None, help="override automatic VLM calibration model detection")
+    parser.add_argument("--prepare-dataset", action="store_true", help="regenerate automatic VLM calibration data even when cached")
     parser.add_argument("--batch-size", type=positive_int, default=1)
     parser.add_argument("--height", type=positive_int, default=448)
     parser.add_argument("--width", type=positive_int, default=448)
@@ -282,6 +283,147 @@ def validate_calibration_dataset(dataset: Path) -> None:
             raise SystemExit(f"Calibration record must contain input text or a sample path: {dataset}")
 
 
+def capture_gemma4_calibration(model_path: Path, output: Path, device: str,
+                              height: int, width: int) -> None:
+    """Capture multimodal language inputs using the fixed vision export shapes.
+
+    Run in a spawned process to release model memory and isolate the upstream
+    Transformers module registration before loading RKLLM.
+    """
+    import importlib.util
+    import pickle
+
+    import torch
+    import numpy as np
+    from PIL import Image
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+    source = VLM_EXPORT / 'modeling_gemma4.py'
+    spec = importlib.util.spec_from_file_location('transformers.models.gemma4.modeling_gemma4', source)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    import transformers.models.gemma4 as pkg
+    for name in module.__all__:
+        setattr(pkg, name, getattr(module, name))
+    import transformers.models.auto as auto
+    for name in dir(auto):
+        mapping = getattr(auto, name, None)
+        if isinstance(getattr(mapping, '_modules', None), dict):
+            mapping._modules.pop('gemma4', None)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_path), config=AutoConfig.from_pretrained(str(model_path)),
+        dtype=torch.float32, low_cpu_mem_usage=True,
+        attn_implementation='eager', local_files_only=True,
+    ).to(device).eval()
+    processor = AutoProcessor.from_pretrained(str(model_path), local_files_only=True)
+    data_root = VLM_DATA.parent
+    records = json.loads((data_root / 'data/datasets.json').read_text())
+    output = output.resolve()
+    samples = output.parent / 'calibration' / 'llm_inputs'
+    samples.mkdir(parents=True, exist_ok=True)
+    captured = []
+
+    class Captured(Exception):
+        """Stop after collecting inputs, before running the language model."""
+
+    def cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: cpu(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(cpu(item) for item in value)
+        return value
+
+    def hook(module, positional, kwargs):
+        captured.append(cpu(kwargs))
+        raise Captured()
+
+    handle = model.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
+    image_tokens = height // 48 * (width // 48)
+    rows = []
+    try:
+        for index, record in enumerate(records):
+            image = Image.open(data_root / record['image_path'] / record['image']).convert('RGB')
+            size = max(image.size)
+            square = Image.new('RGB', (size, size), (127, 127, 127))
+            square.paste(image, ((size - image.width) // 2, (size - image.height) // 2))
+            square = square.resize((width, height), Image.Resampling.BILINEAR)
+            pixels = torch.from_numpy(np.asarray(square, dtype=np.float32).copy() / 255)
+            patches = (pixels.reshape(height // 16, 16, width // 16, 16, 3)
+                       .permute(0, 2, 1, 3, 4).reshape(1, -1, 16 * 16 * 3))
+            y, x = torch.meshgrid(torch.arange(height // 16), torch.arange(width // 16), indexing='ij')
+            positions = torch.stack([x, y], dim=-1).reshape(1, -1, 2)
+            messages = [{'role': 'user', 'content': [
+                {'type': 'image'}, {'type': 'text', 'text': record['input']},
+            ]}]
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            text = text.replace(
+                processor.image_token,
+                processor.boi_token + processor.image_token * image_tokens + processor.eoi_token,
+            )
+            inputs = processor(text=[text], return_tensors='pt', return_mm_token_type_ids=True)
+            actual = int((inputs['input_ids'] == model.config.image_token_id).sum())
+            if actual != image_tokens:
+                raise RuntimeError(f'Expected {image_tokens} image tokens, got {actual}')
+            inputs['pixel_values'] = patches
+            inputs['image_position_ids'] = positions
+            inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value
+                      for key, value in inputs.items()}
+            try:
+                with torch.inference_mode():
+                    model(**inputs, use_cache=False)
+            except Captured:
+                pass
+            if len(captured) != 1:
+                raise RuntimeError('Language inputs were not captured exactly once')
+            value = captured.pop()
+            path = samples / f'sample_{index:03d}.pkl'
+            with path.open('wb') as file:
+                pickle.dump(value, file)
+            rows.append({'sample': str(path), 'token_nums': int(value['inputs_embeds'].shape[1])})
+            print(f"Calibration sample {index + 1}/{len(records)}: {rows[-1]['token_nums']} tokens", flush=True)
+    finally:
+        handle.remove()
+    output.write_text(json.dumps(rows, indent=2) + '\n', encoding='utf-8')
+    print(f'Wrote {len(rows)} samples to {output}', flush=True)
+
+
+def generate_calibration(args: argparse.Namespace, model: Path, dataset: Path) -> None:
+    """Dispatch automatic calibration from the shared conversion entry point."""
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    if input_format(args) == "gguf":
+        raise SystemExit("Pass --dataset for quantized GGUF conversion; the text calibration helper requires a Hugging Face model")
+    if args.kind == "llm":
+        run([sys.executable, str(LLM_EXPORT / "generate_data_quant.py"),
+             "-m", str(model), "-o", str(dataset)], LLM_EXPORT)
+        return
+
+    model_type = infer_dataset_model_type(model, args.model_type)
+    if model_type == "gemma4":
+        worker = multiprocessing.get_context("spawn").Process(
+            target=capture_gemma4_calibration,
+            args=(model, dataset, args.device,
+                  (args.height + 47) // 48 * 48, (args.width + 47) // 48 * 48),
+        )
+        worker.start()
+        try:
+            worker.join()
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+        if worker.exitcode != 0:
+            raise SystemExit("Multimodal calibration failed; see the worker traceback above.")
+    else:
+        run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"),
+             "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
+        sample_root = dataset.parent / "calibration"
+        shutil.copytree(VLM_DATA / "llm_inputs", sample_root / "llm_inputs", dirs_exist_ok=True)
+        make_vlm_dataset_paths_absolute(VLM_DATA / "llm_inputs.json", dataset, sample_root)
+
+
 def default_output(model: Path, dtype: str, platform: str,
                    output_dir: Path | None = None) -> Path:
     suffix = ".rkllm"
@@ -413,7 +555,7 @@ def infer_dataset_model_type(model: Path, explicit: str | None) -> str:
         return "qwen3vl"
     if "qwen2.5_vl" in name or "qwen2_5_vl" in name:
         return "qwen2.5vl"
-    raise SystemExit("No automatic calibration helper for this VLM. Pass --dataset with a prepared multimodal manifest; --model-type selects Qwen helpers only.")
+    raise SystemExit("No automatic calibration helper for this VLM. Pass --dataset with a prepared multimodal manifest; --model-type selects Qwen or Gemma4 calibration.")
 
 
 def copy_onnx(source: Path, destination: Path) -> None:
@@ -575,23 +717,7 @@ def main() -> int:
         else:
             dataset = output_root / f"{model.name}_data_quant.json"
             if not dataset.is_file() or args.prepare_dataset or args.force:
-                if input_format(args) == "gguf":
-                    raise SystemExit("Pass --dataset for quantized GGUF conversion; the text calibration helper requires a Hugging Face model")
-                if args.kind == "llm":
-                    dataset.parent.mkdir(parents=True, exist_ok=True)
-                    run([sys.executable, str(LLM_EXPORT / "generate_data_quant.py"), "-m", str(model), "-o", str(dataset)], LLM_EXPORT)
-                else:
-                    model_type = infer_dataset_model_type(model, args.model_type)
-                    if model_type == "gemma4":
-                        run([sys.executable, str(ROOT / "tools/make_gemma4_calibration.py"),
-                             "--model", str(model), "--output", str(dataset), "--device", args.device,
-                             "--height", str((args.height + 47) // 48 * 48),
-                             "--width", str((args.width + 47) // 48 * 48)], ROOT)
-                    else:
-                        run([sys.executable, str(VLM_DATA / "make_input_embeds_for_quantize.py"), "--path", str(model), "--model_type", model_type], VLM_DATA.parent)
-                        sample_root = output_root / "calibration"
-                        shutil.copytree(VLM_DATA / "llm_inputs", sample_root / "llm_inputs", dirs_exist_ok=True)
-                        make_vlm_dataset_paths_absolute(VLM_DATA / "llm_inputs.json", dataset, sample_root)
+                generate_calibration(args, model, dataset)
             validate_calibration_dataset(dataset)
         if args.kind == "vlm":
             # Resolve relative sample paths against the supplied manifest, not cwd.

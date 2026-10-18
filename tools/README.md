@@ -172,8 +172,10 @@ Text LLMs generate a calibration dataset with upstream `generate_data_quant.py`
 when `--dataset` is omitted. VLM calibration supports Qwen2-VL, Qwen2.5-VL,
 Qwen3-VL, Qwen3.5, and Gemma4, using the SDK's demo images and prompts.
 `--model-type` selects the helper explicitly; checkpoint names are detected
-otherwise. Gemma4 uses `make_gemma4_calibration.py` to capture the actual
-language-model inputs, including per-layer embeddings and local/global masks.
+otherwise. Calibration is dispatched inside `custom_export.py`; no separate
+model-specific command is required. Gemma4 captures the actual language-model
+inputs, including per-layer embeddings and local/global masks, in a child process
+that releases model memory before conversion starts.
 Its square RGB preprocessing, aligned dimensions, positions, and image-token
 count match the fixed vision export. At 480 x 480 it produces 100 image tokens.
 The 20 demo samples provide a smoke-test calibration set, not a quality benchmark.
@@ -183,10 +185,14 @@ For example, after activating `rkllm-3.11`:
 ```bash
 python tools/custom_export.py --kind vlm -m /models/gemma-4-E2B-it \
   -p RK3576 -q w4a16_g128 --device cuda --load-dtype float32 \
-  --height 480 --width 480 --max-context 4096 --prepare-dataset \
+  --height 480 --width 480 --max-context 4096 \
   --output-dir /models/jobs/gemma4-vlm/artifacts
 ```
 
+Calibration is generated automatically only when a pending quantized language
+conversion needs it, and an existing generated dataset is reused.
+`--prepare-dataset` explicitly regenerates automatic VLM calibration.
+Vision-only and audio-only conversion skip calibration by default.
 Other VLMs require an explicit prepared multimodal manifest for quantization.
 A missing or invalid explicit manifest fails instead of being silently
 regenerated. Floating-point conversion skips calibration unless
