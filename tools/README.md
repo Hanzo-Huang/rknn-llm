@@ -193,19 +193,9 @@ and append platform/dtype to the requested stem. Existing artifacts are skipped;
 checkpoint, shapes, or conversion settings. Upstream exporters use shared
 working files: run one conversion command at a time per checkout.
 
-## Validation and SDK updates
-
-```bash
-python tools/custom_export.py --help
-python -m unittest discover -s tests
-```
-
-The tests use fake toolkit APIs to cover the 19-build matrix, API dispatch,
-resume behavior, calibration safety, encoder routing, external ONNX tensors,
-and error propagation. Real model conversion and on-device inference still
-need validation on the supported Linux/toolkit/hardware environment.
+## SDK updates
 
 Keep upstream examples unchanged during SDK updates. Compare the new wheel's
 `rkllm/api/rkllm.py`, SDK manual, and encoder scripts; update the compatibility
-layer, matrix, tests, and this guide together. The current upstream baseline is
-[`release-v1.3.1`](https://github.com/airockchip/rknn-llm/releases/tag/release-v1.3.1).
+layer, platform matrix, and this guide together. The current upstream baseline
+is [`release-v1.3.1`](https://github.com/airockchip/rknn-llm/releases/tag/release-v1.3.1).
