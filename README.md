@@ -29,6 +29,8 @@
 
 # Support Models
 
+- [x] [Spark-X2.5](https://huggingface.co/XHToken) 
+- [x] [LFM2.5-VL-450M](https://huggingface.co/LiquidAI/LFM2.5-VL-450M) 
 - [x] [LLAMA models](https://huggingface.co/meta-llama) 
 - [x] [TinyLLAMA models](https://huggingface.co/TinyLlama) 
 - [x] [Qwen2/Qwen2.5/Qwen3/Qwen3.5](https://huggingface.co/Qwen)
@@ -72,25 +74,28 @@ export LD_LIBRARY_PATH=./lib
 4. Run the demo
 
 ```bash
-Usage: ./demo image_path encoder_model_path llm_model_path max_new_tokens max_context_len rknn_core_num platform [img_start] [img_end] [img_content]
+Usage: ./demo image_path img_encoder_model_path audio_path aud_encoder_model_path llm_model_path max_new_tokens max_context_len rknn_core_num platform [img_start] [img_end] [img_content] [audio_start] [audio_end] [audio_content]
 
-# for Qwen2.5-VL
-./demo demo.jpg ./qwen2_5_vl_3b_vision_rk3588.rknn ./qwen2.5-vl-3b-w8a8_level1_rk3588.rkllm 2048 4096 3 rk3588 "<|vision_start|>" "<|vision_end|>" "<|image_pad|>"
+# for Qwen2.5-VL (pass "" for audio_path/aud_encoder_model_path to disable audio)
+./demo demo.jpg ./qwen2_5_vl_3b_vision_rk3588.rknn "" "" ./qwen2.5-vl-3b-w8a8_level1_rk3588.rkllm 2048 4096 3 rk3588 "<|vision_start|>" "<|vision_end|>" "<|image_pad|>"
 
-# for Qwen3-VL
-./demo demo.jpg ./qwen3-vl-2b_vision_rk3588.rknn ./qwen3-vl-2b-instruct_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "<|vision_start|>" "<|vision_end|>" "<|image_pad|>"
+# for Qwen3-VL (pass "" for audio_path/aud_encoder_model_path to disable audio)
+./demo demo.jpg ./qwen3-vl-2b_vision_rk3588.rknn "" "" ./qwen3-vl-2b-instruct_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "<|vision_start|>" "<|vision_end|>" "<|image_pad|>"
 
-# for Qwen3.5
-./demo demo.jpg ./Qwen3.5-0.8B_vision_rk3588.rknn ./Qwen3.5-0.8B_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "<|vision_start|>" "<|vision_end|>" "<|image_pad|>"
+# for Qwen3.5 (pass "" for audio_path/aud_encoder_model_path to disable audio)
+./demo demo.jpg ./Qwen3.5-0.8B_vision_rk3588.rknn "" "" ./Qwen3.5-0.8B_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "<|vision_start|>" "<|vision_end|>" "<|image_pad|>"
 
-# for InternVL3
-./demo demo.jpg ./internvl3-1b_vision_fp16_rk3588.rknn ./internvl3-1b_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "<img>" "</img>" "<IMG_CONTEXT>"
+# for InternVL3 (pass "" for audio_path/aud_encoder_model_path to disable audio)
+./demo demo.jpg ./internvl3-1b_vision_fp16_rk3588.rknn "" "" ./internvl3-1b_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "<img>" "</img>" "<IMG_CONTEXT>"
 
-# for DeepSeekOCR
-./demo demo.jpg ./deepseekocr_vision_rk3588.rknn ./deepseekocr_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "" "" "<｜▁pad▁｜>"
+# for DeepSeekOCR (pass "" for audio_path/aud_encoder_model_path to disable audio)
+./demo demo.jpg ./deepseekocr_vision_rk3588.rknn "" "" ./deepseekocr_w8a8_rk3588.rkllm 2048 4096 3 rk3588 "" "" "reserved"
+
+# for Gemma4 (image + audio) (pass "" for image_path/img_encoder_model_path to disable image)
+./demo demo.jpg ./gemma-4-E2B-it-vision_rk3588.rknn ./demo.wav ./gemma-4-E2B-it-audio_rk3588.rknn ./gemma-4-E2B-it_fp16_rk3588.rkllm 2048 4096 3 rk3588 "<|image>" "<image|>" "<|image|>" "<|audio>" "<audio|>" "<|audio|>"
 ```
 
-   `[img_start]`, `[img_end]`, and `[img_content]` need to be checked in the model’s configuration file.
+   `[img_start]`, `[img_end]`, `[img_content]`, `[audio_start]`, `[audio_end]`, and `[audio_content]` need to be checked in the model’s configuration file. Pass `""` for a modality (image or audio) and its encoder model path to disable that modality.
 
    For example, in **InternVL3**, you can find them in `modeling_internvl_chat.py` as shown below:
 
@@ -126,7 +131,6 @@ Usage: ./demo image_path encoder_model_path llm_model_path max_new_tokens max_co
 
 - The supported Python versions are:
 
-  - Python 3.9
   - Python 3.10
   - Python 3.11
   - Python 3.12
@@ -138,7 +142,7 @@ export BUILD_CUDA_EXT=0
 ```
 - On some platforms, you may encounter an error indicating that **libomp.so** cannot be found. To resolve this, locate the library in the corresponding cross-compilation toolchain and place it in the board's lib directory, at the same level as librkllmrt.so.
 - RWKV model conversion only supports Python 3.12. Please use `requirements_rwkv7.txt` to set up the pip environment.
-- Latest version: [ <u>v1.3.0](https://github.com/airockchip/rknn-llm/releases/tag/release-v1.3.0)</u>
+- Latest version: [ <u>v1.3.1](https://github.com/airockchip/rknn-llm/releases/tag/release-v1.3.1)</u>
 
 # RKNN Toolkit2
 
@@ -148,18 +152,12 @@ https://github.com/airockchip/rknn-toolkit2
 
 # CHANGELOG
 
-## v1.3.0
+## v1.3.1
 
-- Added support for Qwen3.5, Gemma4, and SmolLM3 models.
-- Optimized the multimodal input interface and cache reuse strategy.
-- Added support for multiple EOS token IDs and introduced the ignore_eos_token parameter.
-- Optimized performance on 32-bit systems.
-- Added support for tokenizer and embedding callbacks.
-- Improved long-context decoding performance for certain models on the RK3576 platform.
-- Optimized the quantization method for embedding input data.
-- Fixed memory usage statistics issues on the RV1126B platform.
-- Fixed numerical overflow issues during inference for certain models on the RK3588 platform.
-- Improved  rkllm_server_demo compatibility with OpenAI API interfaces.
-- Added support for overriding max_new_tokens and sampling parameters in RKLLMInferParam
+- Added support for LFM2.5-VL-450M and Spark-X2.5 models.
+- Added multimodal audio input interface and Gemma4 audio inference demo.
+- Added linear attention cache reuse strategy.
+- Fixed the parsing of UINT32-type EOS token IDs.
+- Fixed Use-After-Free issue caused by multi-instance initialization failure.
 
 for older version, please refer [CHANGELOG](CHANGELOG.md)
