@@ -13,7 +13,7 @@ from pathlib import Path
 def patch_transformers() -> None:
     import transformers
 
-    for class_name in ("Qwen2_5_VLForConditionalGeneration", "Qwen3VLForConditionalGeneration"):
+    for class_name in ("Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration", "Qwen3VLForConditionalGeneration"):
         model_class = getattr(transformers, class_name, None)
         if model_class is not None and not hasattr(model_class, "visual"):
             # Rockchip v1.3.0 accesses vlm.visual; newer Transformers places
