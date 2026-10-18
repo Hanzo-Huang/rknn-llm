@@ -36,9 +36,14 @@ def main() -> None:
             mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         elif name == 'gemma-4':
             mean, std = [0] * 3, [1] * 3
+        # Toolkit2 2.3.2 miscompiles Gemma4 multidimensional RoPE slices
+        # into out-of-range gather indices. Keep the original split/concat.
+        disabled = ['fuse_channel_shuffle_split_concat_to_gather'] if name == 'gemma-4' else []
+        if name == 'deepseekocr':
+            disabled.append('convert_rs_add_rs_to_rs_gather_elements')
         config.update(mean_values=[[x * 255 for x in mean]],
                       std_values=[[x * 255 for x in std]],
-                      disable_rules=['convert_rs_add_rs_to_rs_gather_elements'] if name == 'deepseekocr' else [])
+                      disable_rules=disabled)
         if name in ('qwen2_5-vl-3b', 'qwen3-vl', 'qwen3.5'):
             patch = 14 if name == 'qwen2_5-vl-3b' else 16
             load = dict(inputs=['pixel', 'grid_thw'],
