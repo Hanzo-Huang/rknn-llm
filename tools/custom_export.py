@@ -343,8 +343,26 @@ def capture_gemma4_calibration(model_path: Path, output: Path, device: str,
     handle = model.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
     image_tokens = height // 48 * (width // 48)
     rows = []
+
+    def capture_sample(inputs, kind):
+        inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value
+                  for key, value in inputs.items()}
+        try:
+            with torch.inference_mode():
+                model(**inputs, use_cache=False)
+        except Captured:
+            pass
+        if len(captured) != 1:
+            raise RuntimeError('Language inputs were not captured exactly once')
+        value = captured.pop()
+        path = samples / f'sample_{len(rows):03d}.pkl'
+        with path.open('wb') as file:
+            pickle.dump(value, file)
+        rows.append({'sample': str(path), 'token_nums': int(value['inputs_embeds'].shape[1])})
+        print(f"Calibration sample {len(rows)} ({kind}): {rows[-1]['token_nums']} tokens", flush=True)
+
     try:
-        for index, record in enumerate(records):
+        for record in records:
             image = Image.open(data_root / record['image_path'] / record['image']).convert('RGB')
             size = max(image.size)
             square = Image.new('RGB', (size, size), (127, 127, 127))
@@ -369,21 +387,24 @@ def capture_gemma4_calibration(model_path: Path, output: Path, device: str,
                 raise RuntimeError(f'Expected {image_tokens} image tokens, got {actual}')
             inputs['pixel_values'] = patches
             inputs['image_position_ids'] = positions
-            inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value
-                      for key, value in inputs.items()}
-            try:
-                with torch.inference_mode():
-                    model(**inputs, use_cache=False)
-            except Captured:
-                pass
-            if len(captured) != 1:
-                raise RuntimeError('Language inputs were not captured exactly once')
-            value = captured.pop()
-            path = samples / f'sample_{index:03d}.pkl'
-            with path.open('wb') as file:
-                pickle.dump(value, file)
-            rows.append({'sample': str(path), 'token_nums': int(value['inputs_embeds'].shape[1])})
-            print(f"Calibration sample {index + 1}/{len(records)}: {rows[-1]['token_nums']} tokens", flush=True)
+            capture_sample(inputs, 'image + text')
+
+        # A VLM also serves plain text. Image-only calibration can miss that
+        # activation distribution, especially with W8A8. Reuse the SDK's
+        # general text corpus, without adding model-specific prompt files or
+        # training on hardware validation questions.
+        import ast
+        tree = ast.parse((LLM_EXPORT / 'generate_data_quant.py').read_text())
+        assignment = next(node for node in ast.walk(tree)
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'input_text'
+                                  for target in node.targets))
+        questions = ast.literal_eval(assignment.value)
+        for question in questions:
+            messages = [{'role': 'user', 'content': [{'type': 'text', 'text': question}]}]
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(text=[text], return_tensors='pt', return_mm_token_type_ids=True)
+            capture_sample(inputs, 'text')
     finally:
         handle.remove()
     output.write_text(json.dumps(rows, indent=2) + '\n', encoding='utf-8')
@@ -636,7 +657,8 @@ def export_audio(args: argparse.Namespace, model: Path, output_root: Path, platf
     onnx = output_root / f"{model.name}_audio.onnx"
     rknn = output_root / platform / f"{model.name}_audio_{platform}.rknn"
     if export_onnx and args.audio_stage in ("all", "onnx") and (args.force or not onnx.is_file()):
-        run([sys.executable, str(VLM_EXPORT / "export_audio_gemma4.py"),
+        run([sys.executable, str(ROOT / "tools" / "run_vision.py"),
+             "--stage", "onnx", "--script", str(VLM_EXPORT / "export_audio_gemma4.py"),
              "--model_path", str(model), "--export_audio_path", str(onnx)], VLM_EXPORT)
         if not onnx.is_file():
             raise SystemExit(f"Audio exporter did not create: {onnx}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run either Rockchip VLM vision export stage with compatibility shims."""
+"""Run Rockchip VLM vision/audio export stages with compatibility shims."""
 
 from __future__ import annotations
 
@@ -46,6 +46,74 @@ def patch_gemma4_export() -> None:
         return original(*bound.args, **bound.kwargs)
 
     masks.sdpa_mask = fixed_shape_mask
+
+
+def patch_gemma4_audio_model(module) -> None:
+    """Build the SDK audio sliding-window mask without tracing torch.vmap."""
+    import torch
+
+    def audio_mask(config, inputs_embeds, attention_mask=None, **kwargs):
+        length = inputs_embeds.shape[1]
+        positions = torch.arange(length, device=inputs_embeds.device)
+        distance = positions[:, None] - positions[None, :]
+        left = config.attention_context_left - 1
+        right = config.attention_context_right
+        window = ((distance >= 0) & (distance < left)) | ((distance < 0) & (-distance < right))
+        mask = window[None, None].expand(inputs_embeds.shape[0], 1, length, length)
+        if attention_mask is not None:
+            mask = mask & attention_mask[:, None, None, :].bool()
+        return mask
+
+    def block_context(self, hidden_states):
+        length = int(hidden_states.shape[1])
+        padded = torch.nn.functional.pad(
+            hidden_states, (0, 0, 0, 0, self.max_past_horizon,
+                            self.max_future_horizon + self.chunk_size - 1))
+        blocks = (length + self.chunk_size - 1) // self.chunk_size
+        return torch.stack([padded[:, index * self.chunk_size:
+                                   index * self.chunk_size + self.context_size]
+                            for index in range(blocks)], dim=1)
+
+    # Audio gradient clipping defaults to 1e10 in the FP32 checkpoint. RKNN
+    # lowers Clip to FP16: nonfinite bounds produce zeros on RK3588. Bound the
+    # limit to the representable FP16 range before tracing all three callers.
+    import functools
+
+    for class_name in ("Gemma4AudioFeedForward", "Gemma4AudioLightConv1d", "Gemma4AudioLayer"):
+        cls = getattr(module, class_name)
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def finite_clip_init(self, *args, _init=original_init, **kwargs):
+            _init(self, *args, **kwargs)
+            self.gradient_clipping = min(self.gradient_clipping, torch.finfo(torch.float16).max)
+
+        cls.__init__ = finite_clip_init
+
+    module.Gemma4RMSNorm._norm = stable_rms_norm
+    module.create_bidirectional_mask = audio_mask
+    module.Gemma4AudioAttention._extract_block_context = block_context
+
+    def merge_audio_heads(hidden_states):
+        # RK3576 misorders the 5D (batch, heads, blocks, chunk, dim) transpose.
+        # Each head is already contiguous in time; concatenate 3D head views.
+        batch, heads, blocks, chunk, width = hidden_states.shape
+        return torch.cat([hidden_states[:, index].reshape(batch, blocks * chunk, width)
+                          for index in range(int(heads))], dim=-1)
+
+    import ast
+    tree = ast.parse(Path(module.__file__).read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Gemma4AudioAttention")
+    forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+    source = ast.unparse(forward)
+    original = "attn_output = attn_output.permute(0, 2, 3, 1, 4).reshape(batch_size, num_blocks * self.chunk_size, -1)"
+    if original not in source:
+        raise RuntimeError("Gemma4 audio head layout changed; review the export shim")
+    source = source.replace(original, "attn_output = merge_audio_heads(attn_output)")
+    namespace = dict(vars(module), merge_audio_heads=merge_audio_heads)
+    exec(compile(source, module.__file__, "exec"), namespace)
+    module.Gemma4AudioAttention.forward = namespace["forward"]
+
 
 
 def stable_rms_norm(self, hidden_states):
@@ -108,9 +176,9 @@ def patch_onnx() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a Rockchip VLM vision conversion stage")
+    parser = argparse.ArgumentParser(description="Run a Rockchip VLM encoder conversion stage")
     parser.add_argument("--stage", choices=("onnx", "rknn"), required=True)
-    parser.add_argument("--script", required=True, help="original Rockchip vision script")
+    parser.add_argument("--script", required=True, help="original Rockchip encoder script")
     args, script_args = parser.parse_known_args()
     script = Path(args.script).resolve()
     sys.argv = [str(script), *script_args]
@@ -130,9 +198,15 @@ def main() -> None:
                 "    modeling_spec.loader.exec_module(modeling_module)",
                 "    modeling_spec.loader.exec_module(modeling_module)\n    patch_gemma4_vision_model(modeling_module)",
             )
+        if script.name == "export_audio_gemma4.py":
+            source = source.replace(
+                "    modeling_spec.loader.exec_module(modeling_module)",
+                "    modeling_spec.loader.exec_module(modeling_module)\n    patch_gemma4_audio_model(modeling_module)",
+            )
         exec(compile(source, str(script), "exec"), {
             "__name__": "__main__", "__file__": str(script),
             "patch_gemma4_vision_model": patch_gemma4_vision_model,
+            "patch_gemma4_audio_model": patch_gemma4_audio_model,
         })
     else:
         patch_onnx()
